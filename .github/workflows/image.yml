@@ -1,0 +1,109 @@
+name: image
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version and image tags
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < VERSION)"
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${owner}/sccache-dist"
+          tags="${image}:v${version},${image}:sha-${GITHUB_SHA::12}"
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            tags="${tags},${image}:main"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v${version}" ]; then
+            echo "Git tag $GITHUB_REF_NAME does not match VERSION v${version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          {
+            echo 'tags<<EOF'
+            tr ',' '\n' <<< "$tags"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify upstream binary
+        shell: bash
+        env:
+          SCCACHE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          base_url="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}"
+          tarball="sccache-dist-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          checksum_file="${tarball}.sha256"
+          curl -fsSL -o "/tmp/${tarball}" "${base_url}/${tarball}"
+          curl -fsSL -o "/tmp/${checksum_file}" "${base_url}/${checksum_file}"
+          (cd /tmp && sha256sum --check "${checksum_file}")
+          tar -xzf "/tmp/${tarball}" -C /tmp
+          install -m 0755 "/tmp/sccache-dist-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache-dist" dist/sccache-dist
+          dist/sccache-dist --help >/dev/null
+          dist/sccache-dist scheduler --help >/dev/null
+          dist/sccache-dist server --help >/dev/null
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build smoke-test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          load: true
+          push: false
+          tags: local/sccache-dist:ci
+          build-args: |
+            SCCACHE_VERSION=${{ steps.meta.outputs.version }}
+
+      - name: Smoke test runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm local/sccache-dist:ci --help
+          docker run --rm local/sccache-dist:ci scheduler --help
+          docker run --rm local/sccache-dist:ci server --help
+          docker run --rm --entrypoint /usr/bin/bwrap local/sccache-dist:ci --version
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            SCCACHE_VERSION=${{ steps.meta.outputs.version }}
